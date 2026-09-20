@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# One-click updater for the original wyx2685/V2bX installation.
+# V2bX Xray Geo 文件自动更新和管理脚本。
 #
-# The only download source is the Xray geo-file source used by v2rayN:
-# Loyalsoldier/v2ray-rules-dat. If either download fails or is invalid, the
-# current geoip.dat and geosite.dat are left untouched.
+# 仅使用 v2rayN 使用的 Xray Geo 文件源：Loyalsoldier/v2ray-rules-dat。
+# 任一文件下载失败或校验失败时，都不会修改当前正在使用的文件。
 
 V2BX_DIR=${V2BX_DIR:-/etc/V2bX}
 V2BX_SERVICE=${V2BX_SERVICE:-V2bX.service}
 UPDATER_PATH=${V2BX_GEO_UPDATER:-/usr/local/sbin/v2bx-update-geo}
 MANAGER_PATH=${V2BX_GEO_MANAGER:-/usr/local/bin/v2bx-geo}
 BACKUP_DIR=${V2BX_GEO_BACKUP_DIR:-/var/backups/V2bX-geo}
-VERSION='1.0.1'
+VERSION='1.1.0'
 GEOIP_URL='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
 GEOSITE_URL='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
 
@@ -24,7 +23,7 @@ log() {
 }
 
 fail() {
-  log "ERROR: $*"
+  log "错误：$*"
   exit 1
 }
 
@@ -37,16 +36,17 @@ require_root() {
 
 usage() {
   cat <<'EOF'
-V2bX Xray Geo 文件管理器
+V2bX Geo 文件管理脚本
 
 用法：
   一键安装：bash install.sh
+  交互菜单：v2bx-geo
   安装：    v2bx-geo install
-  更新：    v2bx-geo update
-  状态：    v2bx-geo status
-  日志：    v2bx-geo log
+  立即更新：v2bx-geo update
+  查看状态：v2bx-geo status
+  查看日志：v2bx-geo log
   卸载：    v2bx-geo uninstall
-  版本：    v2bx-geo version
+  查看版本：v2bx-geo version
 EOF
 }
 
@@ -76,25 +76,25 @@ download_and_validate() {
   local output=$3
   local bytes
 
-  log "下载 ${label}..."
+  log "正在下载 ${label}..."
   if ! curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 \
-    --max-time 600 -A 'v2bx-geo-updater/1.0' -o "${output}" "${url}"; then
-    log "${label} 下载失败，保留现有 geo 文件。"
+    --max-time 600 --silent -A 'v2bx-geo-updater/1.1' -o "${output}" "${url}" 2>/dev/null; then
+    log "${label} 下载失败，继续使用原有文件。"
     return 1
   fi
 
   bytes=$(wc -c <"${output}")
   if [[ ${bytes} -lt 1024 ]]; then
-    log "${label} 下载结果过小（${bytes} bytes），保留现有 geo 文件。"
+    log "${label} 下载结果过小（${bytes} 字节），继续使用原有文件。"
     return 1
   fi
 
   if LC_ALL=C head -c 1024 "${output}" | grep -aEiq '<!doctype|<html|rate.?limit'; then
-    log "${label} 下载结果疑似错误页面，保留现有 geo 文件。"
+    log "${label} 下载结果疑似错误页面，继续使用原有文件。"
     return 1
   fi
 
-  log "${label} 校验通过（${bytes} bytes）。"
+  log "${label} 校验通过（${bytes} 字节）。"
 }
 
 update_geo() (
@@ -119,7 +119,7 @@ update_geo() (
   }
   trap cleanup EXIT
 
-  # Both downloads must pass before either target is touched.
+  # 两个文件都通过校验后，才允许替换目标文件。
   download_and_validate geoip.dat "${GEOIP_URL}" "${work_dir}/geoip.dat" || return 1
   download_and_validate geosite.dat "${GEOSITE_URL}" "${work_dir}/geosite.dat" || return 1
 
@@ -190,7 +190,7 @@ update_geo() (
   if systemctl is-active --quiet "${V2BX_SERVICE}"; then
     if ! systemctl restart "${V2BX_SERVICE}"; then
       rollback
-      systemctl restart "${V2BX_SERVICE}" || log 'ERROR: 原文件恢复后 V2bX 仍未恢复，请检查 v2bx log。'
+      systemctl restart "${V2BX_SERVICE}" || log '错误：原文件恢复后 V2bX 仍未恢复，请检查 V2bX 日志。'
       return 1
     fi
     log 'geo 文件已更新，V2bX 已重启并加载新文件。'
@@ -199,9 +199,219 @@ update_geo() (
   fi
 )
 
-command=${1:-install}
+uninstall_geo() {
+  require_root
+  systemctl disable --now v2bx-geo-update.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/v2bx-geo-update.service \
+    /etc/systemd/system/v2bx-geo-update.timer \
+    "${UPDATER_PATH}" "${MANAGER_PATH}"
+  systemctl daemon-reload
+  echo '已卸载 Geo 自动更新任务；备份目录 /var/backups/V2bX-geo/ 未删除。'
+}
 
-case "${command}" in
+show_version() {
+  echo "V2bX Geo 管理脚本版本：${VERSION}"
+}
+
+show_status() {
+  local timer_state='未运行'
+  local timer_enabled='否'
+  local v2bx_state='未运行'
+  local v2bx_enabled='否'
+  local next_time=''
+  local last_time=''
+
+  if systemctl is-active --quiet v2bx-geo-update.timer; then
+    timer_state='运行中'
+  fi
+  if systemctl is-enabled --quiet v2bx-geo-update.timer; then
+    timer_enabled='是'
+  fi
+  if systemctl is-active --quiet "${V2BX_SERVICE}"; then
+    v2bx_state='已运行'
+  fi
+  if systemctl is-enabled --quiet "${V2BX_SERVICE}"; then
+    v2bx_enabled='是'
+  fi
+
+  next_time=$(systemctl show v2bx-geo-update.timer -p NextElapseUSecRealtime --value 2>/dev/null || true)
+  last_time=$(systemctl show v2bx-geo-update.timer -p LastTriggerUSecRealtime --value 2>/dev/null || true)
+
+  echo
+  echo 'V2bX Geo 自动更新状态'
+  echo '--------------------------------'
+  echo "V2bX 状态：${v2bx_state}"
+  echo "V2bX 开机自启：${v2bx_enabled}"
+  echo "Geo 定时任务：${timer_state}"
+  echo "Geo 开机自启：${timer_enabled}"
+  echo '更新时间：每天北京时间凌晨 4:00'
+  if [[ -n ${last_time} && ${last_time} != 'n/a' ]]; then
+    echo "上次执行：${last_time}"
+  else
+    echo '上次执行：暂无记录'
+  fi
+  if [[ -n ${next_time} && ${next_time} != 'n/a' ]]; then
+    echo "下次执行：${next_time}"
+  else
+    echo '下次执行：暂时无法获取'
+  fi
+  echo "Geo 文件目录：${V2BX_DIR}"
+}
+
+show_log() {
+  echo
+  echo 'V2bX Geo 最近更新日志'
+  echo '--------------------------------'
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -u v2bx-geo-update.service -n 100 --no-pager -o cat || true
+  else
+    echo '当前系统没有找到日志查看工具 journalctl。'
+  fi
+}
+
+show_geo_info() {
+  local file_name path size modified
+
+  echo
+  echo 'V2bX Geo 文件信息'
+  echo '--------------------------------'
+  for file_name in geoip.dat geosite.dat; do
+    path="${V2BX_DIR}/${file_name}"
+    if [[ -f ${path} ]]; then
+      if size=$(stat -c '%s' "${path}" 2>/dev/null); then
+        :
+      else
+        size='未知'
+      fi
+      if modified=$(stat -c '%y' "${path}" 2>/dev/null); then
+        modified=${modified%%.*}
+      else
+        modified='未知'
+      fi
+      echo "${file_name}：已存在，大小 ${size} 字节，修改时间 ${modified}"
+    else
+      echo "${file_name}：不存在"
+    fi
+  done
+}
+
+reload_timer() {
+  require_root
+  if systemctl daemon-reload && systemctl enable --now v2bx-geo-update.timer; then
+    echo 'Geo 自动更新任务已重新加载并启用。'
+  else
+    echo 'Geo 自动更新任务重载失败，请检查 systemd 状态。' >&2
+    return 1
+  fi
+}
+
+pause_menu() {
+  read -r -p '按回车键返回菜单...' _ || true
+}
+
+show_menu() {
+  local choice confirm timer_state v2bx_state timer_enabled
+
+  while true; do
+    clear 2>/dev/null || true
+    timer_state='未运行'
+    v2bx_state='未运行'
+    timer_enabled='否'
+    if systemctl is-active --quiet v2bx-geo-update.timer; then
+      timer_state='运行中'
+    fi
+    if systemctl is-active --quiet "${V2BX_SERVICE}"; then
+      v2bx_state='已运行'
+    fi
+    if systemctl is-enabled --quiet v2bx-geo-update.timer; then
+      timer_enabled='是'
+    fi
+
+    echo
+    echo 'V2bX Geo 文件管理脚本'
+    echo '--- https://github.com/GinGer0408/v2bx-geofile-update ---'
+    echo '--------------------------------'
+    echo "V2bX 状态：${v2bx_state}"
+    echo "Geo 定时任务：${timer_state}"
+    echo "是否开机自启：${timer_enabled}"
+    echo '--------------------------------'
+    echo '0. 立即更新 Geo 文件'
+    echo '1. 查看自动更新状态'
+    echo '2. 查看更新日志'
+    echo '3. 重载自动更新任务'
+    echo '4. 查看 Geo 文件信息'
+    echo '5. 卸载自动更新任务'
+    echo '6. 查看脚本版本'
+    echo '7. 退出脚本'
+    echo '--------------------------------'
+    read -r -p '请输入选择 [0-7]：' choice || return 0
+    echo
+
+    case ${choice} in
+      0)
+        update_geo || echo 'Geo 文件更新失败，原文件未被替换。'
+        pause_menu
+        ;;
+      1)
+        show_status
+        pause_menu
+        ;;
+      2)
+        show_log
+        pause_menu
+        ;;
+      3)
+        reload_timer || true
+        pause_menu
+        ;;
+      4)
+        show_geo_info
+        pause_menu
+        ;;
+      5)
+        read -r -p '确定要卸载 Geo 自动更新任务吗？请输入 y 确认：' confirm || confirm=''
+        if [[ ${confirm} == 'y' || ${confirm} == 'Y' ]]; then
+          uninstall_geo
+          return 0
+        fi
+        echo '已取消卸载。'
+        pause_menu
+        ;;
+      6)
+        show_version
+        pause_menu
+        ;;
+      7)
+        echo '已退出脚本。'
+        return 0
+        ;;
+      *)
+        echo '输入无效，请输入 0 到 7。'
+        pause_menu
+        ;;
+    esac
+  done
+}
+
+invoked_path=$0
+resolved_path=''
+if [[ ${invoked_path} != */* ]]; then
+  resolved_path=$(command -v -- "${invoked_path}" 2>/dev/null || true)
+  if [[ -n ${resolved_path} ]]; then
+    invoked_path=${resolved_path}
+  fi
+fi
+script_path=$(CDPATH= cd -- "$(dirname -- "${invoked_path}")" && pwd)/$(basename -- "${invoked_path}")
+
+if [[ $# -eq 0 && ${script_path} == "${MANAGER_PATH}" ]]; then
+  require_root
+  show_menu
+  exit $?
+fi
+
+action=${1:-install}
+
+case "${action}" in
   --update|update)
     require_root
     update_geo
@@ -209,27 +419,20 @@ case "${command}" in
     ;;
   status)
     require_root
-    systemctl status v2bx-geo-update.timer --no-pager -l
-    systemctl list-timers v2bx-geo-update.timer --no-pager
+    show_status
     exit 0
     ;;
   log)
     require_root
-    journalctl -u v2bx-geo-update.service -n 100 --no-pager
+    show_log
     exit 0
     ;;
   uninstall)
-    require_root
-    systemctl disable --now v2bx-geo-update.timer 2>/dev/null || true
-    rm -f /etc/systemd/system/v2bx-geo-update.service \
-      /etc/systemd/system/v2bx-geo-update.timer \
-      "${UPDATER_PATH}" "${MANAGER_PATH}"
-    systemctl daemon-reload
-    echo '已卸载定时更新服务；/var/backups/V2bX-geo/ 保留未删除。'
+    uninstall_geo
     exit 0
     ;;
   version)
-    echo "v2bx-geo ${VERSION}"
+    show_version
     exit 0
     ;;
   install)
@@ -251,7 +454,6 @@ install_dependencies
   exit 1
 }
 
-script_path=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")
 install -d -m 0755 "$(dirname -- "${UPDATER_PATH}")"
 install -d -m 0755 "$(dirname -- "${MANAGER_PATH}")"
 
@@ -274,7 +476,7 @@ trap 'rm -f "${service_tmp}" "${timer_tmp}"' EXIT
 
 cat >"${service_tmp}" <<EOF
 [Unit]
-Description=Update V2bX Xray geo files from the v2rayN source
+Description=从 v2rayN 兼容源更新 V2bX Xray Geo 文件
 Wants=network-online.target
 After=network-online.target
 
@@ -285,7 +487,7 @@ EOF
 
 cat >"${timer_tmp}" <<EOF
 [Unit]
-Description=Daily V2bX Xray geo update at Beijing time 04:00
+Description=每天北京时间凌晨 4 点更新 V2bX Xray Geo 文件
 
 [Timer]
 OnCalendar=*-*-* 04:00:00 Asia/Shanghai
@@ -303,11 +505,11 @@ install -m 0644 "${timer_tmp}" /etc/systemd/system/v2bx-geo-update.timer
 systemctl daemon-reload
 systemctl enable --now v2bx-geo-update.timer
 
-# Verify immediately; the timer repeats this every day at 04:00 Asia/Shanghai.
+# 安装完成后立即执行一次，之后由定时任务每天北京时间凌晨 4 点执行。
 "${UPDATER_PATH}" --update
 
 echo
 echo '安装完成。'
-echo '更新时间：每天北京时间 04:00。'
-echo "管理命令：${MANAGER_PATH} status|update|log|uninstall"
-echo '失败容灾：下载失败或校验失败时，继续使用原来的 geo 文件，不切换其他源。'
+echo '更新时间：每天北京时间凌晨 4:00。'
+echo "管理命令：${MANAGER_PATH}（直接运行可打开中文管理菜单）"
+echo '失败容灾：下载失败或校验失败时，继续使用原有 Geo 文件，不切换其他源。'

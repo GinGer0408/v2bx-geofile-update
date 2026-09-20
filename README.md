@@ -23,8 +23,23 @@ wget -N https://raw.githubusercontent.com/GinGer0408/v2bx-geofile-update/main/in
 
 ## 管理命令
 
+安装完成后，直接运行 `v2bx-geo` 即可打开中文管理菜单：
+
+```text
+0. 立即更新 Geo 文件
+1. 查看自动更新状态
+2. 查看更新日志
+3. 重载自动更新任务
+4. 查看 Geo 文件信息
+5. 卸载自动更新任务
+6. 查看脚本版本
+7. 退出脚本
+```
+
+也可以直接使用命令：
+
 ```bash
-v2bx-geo status      # 查看定时器状态
+v2bx-geo status      # 查看自动更新状态
 v2bx-geo update      # 立即手动更新
 v2bx-geo log         # 查看更新日志
 v2bx-geo version     # 查看脚本版本
