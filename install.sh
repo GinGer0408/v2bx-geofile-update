@@ -12,7 +12,7 @@ V2BX_SERVICE=${V2BX_SERVICE:-V2bX.service}
 UPDATER_PATH=${V2BX_GEO_UPDATER:-/usr/local/sbin/v2bx-update-geo}
 MANAGER_PATH=${V2BX_GEO_MANAGER:-/usr/local/bin/v2bx-geo}
 BACKUP_DIR=${V2BX_GEO_BACKUP_DIR:-/var/backups/V2bX-geo}
-VERSION='1.0.0'
+VERSION='1.0.1'
 GEOIP_URL='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
 GEOSITE_URL='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
 
@@ -254,8 +254,19 @@ install_dependencies
 script_path=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")
 install -d -m 0755 "$(dirname -- "${UPDATER_PATH}")"
 install -d -m 0755 "$(dirname -- "${MANAGER_PATH}")"
-install -m 0755 "${script_path}" "${UPDATER_PATH}"
-install -m 0755 "${script_path}" "${MANAGER_PATH}"
+
+copy_script() {
+  local source_path=$1
+  local target_path=$2
+  if [[ "${source_path}" == "${target_path}" ]]; then
+    chmod 0755 "${target_path}"
+  else
+    install -m 0755 "${source_path}" "${target_path}"
+  fi
+}
+
+copy_script "${script_path}" "${UPDATER_PATH}"
+copy_script "${script_path}" "${MANAGER_PATH}"
 
 service_tmp=$(mktemp)
 timer_tmp=$(mktemp)
