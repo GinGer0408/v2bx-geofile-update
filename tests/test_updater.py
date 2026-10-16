@@ -1,5 +1,6 @@
 """Run isolated updater transactions with real files and mocked external services."""
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -36,6 +37,8 @@ class UpdaterTests(unittest.TestCase):
         self.mock('curl', '''#!/usr/bin/env python3
 import hashlib, os, pathlib, sys
 a = sys.argv[1:]
+with (pathlib.Path(os.environ['TEST_ROOT']) / 'downloads').open('a') as calls:
+    calls.write(a[-1] + '\\n')
 if '--write-out' in a:
     if os.environ.get('BAD_RELEASE'):
         print('https://example.com/untrusted/geoip.dat', end='')
@@ -94,7 +97,11 @@ fi
         path.chmod(0o755)
 
     def update(self, **env):
-        return self.run_function('update_geo', **env)
+        result = self.run_function('update_geo', **env)
+        for line in result.stdout.splitlines():
+            if '保留恢复现场：/tmp/v2bx-geo-update.' in line:
+                self.addCleanup(shutil.rmtree, line.split('保留恢复现场：', 1)[1], True)
+        return result
 
     def run_function(self, body, **env):
         return subprocess.run(['bash', '-c', 'source "$1"; require_root() { return 0; }; ' + body, '_',
@@ -104,16 +111,20 @@ fi
     def state(self):
         return dict(line.split('\t', 1) for line in (self.root / 'state' / 'status').read_text().splitlines())
 
-    def installed_pair(self, version='1.3.0'):
-        old = SOURCE.read_text().replace("VERSION='1.3.0'", f"VERSION='{version}'")
+    def installed_pair(self, version='1.4.0'):
+        old = SOURCE.read_text().replace("VERSION='1.4.0'", f"VERSION='{version}'")
         for key in ('V2BX_GEO_UPDATER', 'V2BX_GEO_MANAGER'):
             path = Path(self.env[key])
             path.parent.mkdir(exist_ok=True)
             path.write_text(old)
+        units = self.root / 'units'
+        units.mkdir(exist_ok=True)
+        (units / 'v2bx-geo-update.service').write_text('[Service]\nType=oneshot\nExecStart="' + self.env['V2BX_GEO_UPDATER'] + '" --scheduled-update\nEnvironment="CUSTOM=keep"\n')
+        (units / 'v2bx-geo-update.timer').write_text('[Timer]\nOnCalendar=*-*-* 04:00:00 Asia/Shanghai\n')
         return old
 
     def remote_version(self, version):
-        (self.root / 'remote.sh').write_text(SOURCE.read_text().replace("VERSION='1.3.0'", f"VERSION='{version}'"))
+        (self.root / 'remote.sh').write_text(SOURCE.read_text().replace("VERSION='1.4.0'", f"VERSION='{version}'"))
 
     def test_status_converts_utc_to_beijing_in_any_timezone(self):
         for zone in ('UTC', 'America/Los_Angeles', 'Asia/Tokyo'):
@@ -141,7 +152,7 @@ fi
     def test_failed_update_retains_last_success(self):
         self.assertEqual(self.update().returncode, 0)
         success = self.state()['success']
-        self.assertNotEqual(self.update(FAIL_DOWNLOAD='geosite.dat').returncode, 0)
+        self.assertNotEqual(self.update(FAIL_DOWNLOAD='geosite.dat.sha256sum').returncode, 0)
         self.assertEqual(self.state()['result'], 'failed')
         self.assertEqual(self.state()['success'], success)
 
@@ -184,14 +195,20 @@ fi
         self.assertNotEqual(result.returncode, 0)
         self.assert_originals()
         self.assertIn('原文件恢复后 V2bX 仍未恢复', result.stdout)
+        self.assertEqual(self.state()['result'], 'recovery_failed')
+        before = (self.root / 'downloads').read_text()
+        blocked = self.update(DIE_AFTER_RESTART='1')
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn('保护备份', blocked.stdout)
+        self.assertEqual((self.root / 'downloads').read_text(), before)
 
     def test_self_update_replaces_both_scripts(self):
         self.installed_pair()
-        self.remote_version('1.4.0')
+        self.remote_version('1.5.0')
         result = self.run_function('self_update')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for key in ('V2BX_GEO_UPDATER', 'V2BX_GEO_MANAGER'):
-            self.assertIn("VERSION='1.4.0'", Path(self.env[key]).read_text())
+            self.assertIn("VERSION='1.5.0'", Path(self.env[key]).read_text())
         self.assert_originals()
         self.assertFalse(self.calls.exists())
 
@@ -203,7 +220,7 @@ fi
 
     def test_self_update_same_version_no_change(self):
         old = self.installed_pair()
-        self.remote_version('1.3.0')
+        self.remote_version('1.4.0')
         result = self.run_function('self_update')
         self.assertEqual(result.returncode, 0)
         self.assertIn('当前已是最新版本', result.stdout)
@@ -226,7 +243,7 @@ fi
 
     def test_self_update_second_replace_failure_restores_both(self):
         old = self.installed_pair()
-        self.remote_version('1.4.0')
+        self.remote_version('1.5.0')
         self.mock('mv', '''#!/bin/sh
 case "$*" in
   *manager.new*)
@@ -240,6 +257,109 @@ exec /usr/bin/mv "$@"
         self.assertNotEqual(self.run_function('self_update').returncode, 0)
         for key in ('V2BX_GEO_UPDATER', 'V2BX_GEO_MANAGER'):
             self.assertEqual(Path(self.env[key]).read_text(), old)
+
+    def legacy_service(self):
+        path = self.root / 'units' / 'v2bx-geo-update.service'
+        path.write_text(path.read_text().replace('--scheduled-update', '--update'))
+        return path
+
+    def test_self_update_migrates_units_without_changing_settings(self):
+        self.installed_pair()
+        service = self.legacy_service()
+        previous = service.read_text()
+        timer = self.root / 'units' / 'v2bx-geo-update.timer'
+        timer.write_text('[Timer]\nOnCalendar=weekly\nPersistent=false\n')
+        self.remote_version('1.5.0')
+        result = self.run_function('self_update')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(service.read_text(), previous.replace('--update', '--scheduled-update'))
+        self.assertEqual(timer.read_text(), '[Timer]\nOnCalendar=weekly\nPersistent=false\n')
+        self.assertEqual(self.calls.read_text(), 'daemon-reload\n')
+        self.assert_originals()
+
+    def test_same_version_repairs_pending_migration(self):
+        old = self.installed_pair()
+        service = self.legacy_service()
+        self.remote_version('1.4.0')
+        result = self.run_function('self_update')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('--scheduled-update', service.read_text())
+        self.assertEqual(Path(self.env['V2BX_GEO_MANAGER']).read_text(), old)
+        self.assertEqual(self.calls.read_text(), 'daemon-reload\n')
+
+    def test_unit_migration_failure_restores_scripts_and_service(self):
+        old = self.installed_pair()
+        service = self.legacy_service()
+        previous = service.read_text()
+        self.remote_version('1.5.0')
+        self.mock('mv', '''#!/bin/sh
+case "$*" in
+  *v2bx-geo-update.service.new*)
+    if [ ! -f "$TEST_ROOT/unit-failed" ]; then
+      touch "$TEST_ROOT/unit-failed"
+      exit 1
+    fi ;;
+esac
+exec /usr/bin/mv "$@"
+''')
+        result = self.run_function('self_update')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(service.read_text(), previous)
+        for key in ('V2BX_GEO_UPDATER', 'V2BX_GEO_MANAGER'):
+            self.assertEqual(Path(self.env[key]).read_text(), old)
+
+    def test_reload_failure_restores_scripts_and_service(self):
+        old = self.installed_pair()
+        service = self.legacy_service()
+        previous = service.read_text()
+        self.remote_version('1.5.0')
+        self.mock('systemctl', '''#!/bin/sh
+echo "$*" >> "$TEST_ROOT/calls"
+if [ ! -f "$TEST_ROOT/reload-failed" ]; then
+  touch "$TEST_ROOT/reload-failed"
+  exit 1
+fi
+''')
+        result = self.run_function('self_update')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(service.read_text(), previous)
+        for key in ('V2BX_GEO_UPDATER', 'V2BX_GEO_MANAGER'):
+            self.assertEqual(Path(self.env[key]).read_text(), old)
+        self.assertEqual(self.calls.read_text(), 'daemon-reload\ndaemon-reload\n')
+
+    def test_custom_unknown_unit_is_not_overwritten(self):
+        old = self.installed_pair()
+        service = self.root / 'units' / 'v2bx-geo-update.service'
+        service.write_text('[Service]\nExecStart=/custom/command --custom\n')
+        self.remote_version('1.5.0')
+        result = self.run_function('self_update')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(Path(self.env['V2BX_GEO_MANAGER']).read_text(), old)
+        self.assertEqual(service.read_text(), '[Service]\nExecStart=/custom/command --custom\n')
+        self.assertFalse(self.calls.exists())
+
+    @unittest.skipUnless(os.geteuid() == 0, 'installed manager CLI requires root')
+    def test_real_1_3_updater_then_first_new_command_completes_migration(self):
+        self.installed_pair('1.3.0')
+        service = self.legacy_service()
+        fixture = SOURCE.parent / 'tests' / 'fixtures' / 'self_update_1_3.sh'
+        self.remote_version('1.4.0')
+        result = self.run_function('source "' + str(fixture) + '"; self_update')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('--update', service.read_text())
+        result = subprocess.run(['bash', self.env['V2BX_GEO_MANAGER'], 'version'],
+                                env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('1.4.0', result.stdout)
+        self.assertIn('--scheduled-update', service.read_text())
+        self.assertEqual(self.calls.read_text(), 'daemon-reload\n')
+        self.assertEqual((self.root / 'downloads').read_text().splitlines(), [
+            'https://raw.githubusercontent.com/GinGer0408/v2bx-geofile-update/main/install.sh'])
+        self.assert_originals()
+        result = subprocess.run(['bash', self.env['V2BX_GEO_MANAGER'], 'version'],
+                                env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.calls.read_text(), 'daemon-reload\n')
 
     def test_uninstall_preserves_geo_and_history(self):
         self.installed_pair()
@@ -269,7 +389,6 @@ exec /usr/bin/mv "$@"
         self.assertEqual((state_dir / 'update.log.1').stat().st_size, 1048576)
         self.assertLess((state_dir / 'update.log').stat().st_size, 1048576)
 
-    @unittest.skipUnless(os.geteuid() == 0, 'isolated installation launches a root-only child')
     def test_install_generates_valid_units_and_keeps_existing_data(self):
         result = self.run_function('install_dependencies() { return 0; }; script_path="$2"; install_geo')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -283,7 +402,6 @@ exec /usr/bin/mv "$@"
         self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
         self.assertEqual(self.state()['result'], 'updated')
 
-    @unittest.skipUnless(os.geteuid() == 0, 'isolated installation launches a root-only child')
     def test_initial_download_failure_still_enables_timer_and_reports_failure(self):
         result = self.run_function('install_dependencies() { return 0; }; script_path="$2"; install_geo',
                                    FAIL_DOWNLOAD='geoip.dat')
@@ -395,6 +513,93 @@ exec /usr/bin/mv "$@"
             (self.geo / name).write_bytes((('old-' + name) * 300).encode())
         self.assertEqual(self.update(UNCHANGED='1').returncode, 0)
         self.assertFalse(self.calls.exists())
+
+    def test_unchanged_data_is_not_downloaded(self):
+        self.assertEqual(self.update().returncode, 0)
+        (self.root / 'downloads').unlink()
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        requests = (self.root / 'downloads').read_text().splitlines()
+        self.assertFalse(any(url.endswith('/geoip.dat') and '/releases/download/' in url for url in requests))
+        self.assertFalse(any(url.endswith('/geosite.dat') and '/releases/download/' in url for url in requests))
+        self.assertEqual(sum(url.endswith('.sha256sum') for url in requests), 2)
+        self.assertEqual(self.state()['result'], 'unchanged')
+
+    def test_only_changed_data_is_downloaded(self):
+        self.assertEqual(self.update().returncode, 0)
+        (self.geo / 'geoip.dat').write_bytes(b'locally-corrupted')
+        (self.root / 'downloads').unlink()
+        self.assertEqual(self.update().returncode, 0)
+        requests = (self.root / 'downloads').read_text().splitlines()
+        self.assertTrue(any(url.endswith('/geoip.dat') and '/releases/download/' in url for url in requests))
+        self.assertFalse(any(url.endswith('/geosite.dat') and '/releases/download/' in url for url in requests))
+
+    def test_verified_metadata_survives_failed_update(self):
+        import hashlib
+        self.assertEqual(self.update().returncode, 0)
+        state = self.state()
+        self.assertEqual(state['release'], '202610152206')
+        for label in ('geoip', 'geosite'):
+            self.assertEqual(state[label + '_sha256'], hashlib.sha256((self.geo / (label + '.dat')).read_bytes()).hexdigest())
+        self.assertNotEqual(self.update(FAIL_DOWNLOAD='geosite.dat.sha256sum').returncode, 0)
+        for key in ('release', 'geoip_sha256', 'geosite_sha256', 'success'):
+            self.assertEqual(self.state()[key], state[key])
+        status = self.run_function('show_status').stdout
+        self.assertIn('最近成功验证的上游版本：202610152206', status)
+        self.assertIn(state['geoip_sha256'], status)
+
+    def test_install_keeps_lock_until_timer_enabled(self):
+        self.mock('systemctl', '''#!/bin/bash
+if [[ $1 == enable ]]; then
+  if flock -n "$V2BX_GEO_STATE_DIR/.lock" -c true; then
+    echo 'installation lock was released too early' >&2
+    exit 1
+  fi
+fi
+exit 0
+''')
+        result = self.run_function('install_dependencies() { return 0; }; script_path="$2"; install_geo')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.state()['result'], 'updated')
+        self.assertTrue(Path(self.env['V2BX_GEO_MANAGER']).exists())
+
+    @unittest.skipUnless(os.geteuid() == 0, 'scheduled CLI requires root')
+    def test_scheduled_update_waits_for_management_lock(self):
+        self.scheduled_update_wait(False)
+
+    @unittest.skipUnless(os.geteuid() == 0, 'scheduled CLI requires root')
+    def test_waiting_scheduled_update_skips_after_uninstall(self):
+        self.scheduled_update_wait(True)
+
+    def scheduled_update_wait(self, uninstall):
+        import fcntl
+        import time
+        (self.root / 'state').mkdir()
+        (self.root / 'units').mkdir()
+        timer = self.root / 'units' / 'v2bx-geo-update.timer'
+        timer.touch()
+        with (self.root / 'state' / '.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process = subprocess.Popen(['bash', str(SOURCE), '--scheduled-update'],
+                                       env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                time.sleep(0.15)
+                self.assertIsNone(process.poll())
+                self.assertFalse((self.root / 'downloads').exists())
+                if uninstall:
+                    timer.unlink()
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                stdout, stderr = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+        if uninstall:
+            self.assertFalse((self.root / 'downloads').exists())
+            self.assertFalse((self.root / 'state' / 'status').exists())
+        else:
+            self.assertEqual(self.state()['result'], 'updated')
 
     def test_concurrent_update_rejected(self):
         import fcntl

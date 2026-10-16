@@ -17,7 +17,7 @@ BACKUP_DIR=${V2BX_GEO_BACKUP_DIR:-/var/backups/V2bX-geo}
 STATE_DIR=${V2BX_GEO_STATE_DIR:-/var/lib/v2bx-geo}
 UNIT_DIR=${V2BX_GEO_UNIT_DIR:-/etc/systemd/system}
 SCRIPT_URL='https://raw.githubusercontent.com/GinGer0408/v2bx-geofile-update/main/install.sh'
-VERSION='1.3.0'
+VERSION='1.4.0'
 GEOIP_URL='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
 
 log() {
@@ -75,7 +75,9 @@ acquire_lock() {
   install -d -m 0700 "${STATE_DIR}" || return 1
   # 锁文件保持原位；即使 V2bX 目录已移除，也应能卸载管理任务。
   exec 9>"${STATE_DIR}/.lock" || return 1
-  if ! flock -n 9; then
+  if [[ ${1:-} == wait ]]; then
+    flock 9 || return 1
+  elif ! flock -n 9; then
     log '另一个 Geo 管理任务正在运行，请稍后重试。'
     return 1
   fi
@@ -84,12 +86,16 @@ acquire_lock() {
 load_state() {
   local key value
   last_attempt=0 last_success=0 last_result='unknown'
+  last_release='' last_geoip_hash='' last_geosite_hash=''
   [[ -f ${STATE_DIR}/status ]] || return 0
   while IFS=$'\t' read -r key value; do
     case ${key} in
       attempt) [[ ${value} =~ ^[0-9]+$ ]] && last_attempt=${value} ;;
       success) [[ ${value} =~ ^[0-9]+$ ]] && last_success=${value} ;;
       result) last_result=${value} ;;
+      release) [[ ${value} =~ ^[[:alnum:]._-]+$ ]] && last_release=${value} ;;
+      geoip_sha256) [[ ${value} =~ ^[[:xdigit:]]{64}$ ]] && last_geoip_hash=${value} ;;
+      geosite_sha256) [[ ${value} =~ ^[[:xdigit:]]{64}$ ]] && last_geosite_hash=${value} ;;
     esac
   done <"${STATE_DIR}/status"
   return 0
@@ -98,8 +104,9 @@ load_state() {
 save_state() {
   local state_tmp
   state_tmp=$(mktemp "${STATE_DIR}/.status.XXXXXX") || return 1
-  if printf 'attempt\t%s\nsuccess\t%s\nresult\t%s\n' \
-    "${last_attempt}" "${last_success}" "${last_result}" >"${state_tmp}" &&
+  if printf 'attempt\t%s\nsuccess\t%s\nresult\t%s\nrelease\t%s\ngeoip_sha256\t%s\ngeosite_sha256\t%s\n' \
+    "${last_attempt}" "${last_success}" "${last_result}" \
+    "${last_release}" "${last_geoip_hash}" "${last_geosite_hash}" >"${state_tmp}" &&
     mv -f "${state_tmp}" "${STATE_DIR}/status"; then
     return 0
   fi
@@ -157,11 +164,38 @@ download_and_validate() {
   local output=$3
   local bytes expected actual
 
-  log "正在下载 ${label}..."
+  local current=${4:-}
+  validated_hash=''
   if ! curl -fL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --connect-timeout 20 \
-    --max-time 600 --silent --show-error -A "v2bx-geo-updater/${VERSION}" -o "${output}" "${url}"; then
-    log "${label} 下载失败，继续使用原有文件。"
+    --max-time 60 --silent --show-error -o "${output}.sha256sum" "${url}.sha256sum"; then
+    log "${label} 校验文件下载失败，继续使用原有文件。"
     return 1
+  fi
+  read -r expected _ <"${output}.sha256sum" || {
+    log "${label} 校验文件格式错误。"
+    return 1
+  }
+  if [[ ! ${expected} =~ ^[[:xdigit:]]{64}$ ]]; then
+    log "${label} 校验文件格式错误。"
+    return 1
+  fi
+  expected=${expected,,}
+  if [[ -n ${current} && -f ${current} && ! -L ${current} ]]; then
+    actual=$(sha256sum -- "${current}") || return 1
+    actual=${actual%% *}
+  else
+    actual=''
+  fi
+  if [[ ${actual} == "${expected}" ]]; then
+    log "${label} 与上游校验和一致，跳过数据下载。"
+    cp -- "${current}" "${output}" || return 1
+  else
+    log "正在下载 ${label}..."
+    if ! curl -fL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --connect-timeout 20 \
+      --max-time 600 --silent --show-error -A "v2bx-geo-updater/${VERSION}" -o "${output}" "${url}"; then
+      log "${label} 下载失败，继续使用原有文件。"
+      return 1
+    fi
   fi
 
   bytes=$(wc -c <"${output}")
@@ -176,26 +210,14 @@ download_and_validate() {
     return 1
   fi
 
-  if ! curl -fL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --connect-timeout 20 \
-    --max-time 60 --silent --show-error -o "${output}.sha256sum" "${url}.sha256sum"; then
-    log "${label} 校验文件下载失败，继续使用原有文件。"
-    return 1
-  fi
-  read -r expected _ <"${output}.sha256sum" || {
-    log "${label} 校验文件格式错误。"
-    return 1
-  }
-  if [[ ! ${expected} =~ ^[[:xdigit:]]{64}$ ]]; then
-    log "${label} 校验文件格式错误。"
-    return 1
-  fi
   actual=$(sha256sum -- "${output}") || return 1
   actual=${actual%% *}
   if [[ ${actual,,} != "${expected,,}" ]]; then
     log "${label} SHA-256 校验失败，继续使用原有文件。"
     return 1
   fi
-  log "${label} SHA-256 校验通过（${bytes} 字节）。"
+  validated_hash=${actual,,}
+  log "${label} SHA-256 校验通过（${bytes} 字节，${validated_hash}）。"
 }
 
 resolve_release() {
@@ -209,10 +231,22 @@ resolve_release() {
   release_base=${target%/*}
 }
 
+update_geo() (
+  acquire_lock "${1:-}" || return 1
+  if [[ ${1:-} == wait && ! -f ${UNIT_DIR}/v2bx-geo-update.timer ]]; then
+    log '定时任务已卸载，跳过等待中的更新。'
+    return 0
+  fi
+  update_geo_locked
+)
+
+# 内部入口：调用方必须持有管理锁；安装首次检查复用同一把锁。
 # 状态通过 save_state/load_state 文件交换，不依赖子 shell 变量传播。
 # shellcheck disable=SC2030
-update_geo() (
-  local last_attempt last_success last_result
+update_geo_locked() (
+  local last_attempt last_success last_result last_release last_geoip_hash last_geosite_hash
+  local candidate_geoip_hash='' candidate_geosite_hash=''
+  local release_base
   geoip_path=${V2BX_DIR}/geoip.dat
   geosite_path=${V2BX_DIR}/geosite.dat
   work_dir=''
@@ -232,7 +266,6 @@ update_geo() (
   command -v flock >/dev/null 2>&1 || fail 'flock 未安装，请安装 util-linux'
   command -v sha256sum >/dev/null 2>&1 || fail 'sha256sum 未安装，请安装 coreutils'
 
-  acquire_lock || return 1
   prepare_state || return 1
   load_state
   if [[ ${last_result} == recovery_failed || ${last_result} == running ]]; then
@@ -250,7 +283,10 @@ update_geo() (
     if [[ ${transaction_pending} -eq 1 ]]; then
       if rollback; then
         if [[ ${restart_attempted} -eq 1 ]]; then
-          restart_v2bx || log '错误：原文件恢复后 V2bX 仍未恢复，请检查 V2bX 日志。'
+          if ! restart_v2bx; then
+            recovery_failed=1
+            log '错误：原文件恢复后 V2bX 仍未恢复，暂停后续更新，请检查 V2bX 日志。'
+          fi
         fi
       else
         recovery_failed=1
@@ -267,6 +303,9 @@ update_geo() (
         log '本次 Geo 更新失败，请查看前面的错误和恢复结果。'
       elif [[ ${last_result} != running ]]; then
         last_success=$(date +%s)
+        last_release=${release_base##*/}
+        last_geoip_hash=${candidate_geoip_hash}
+        last_geosite_hash=${candidate_geosite_hash}
       fi
     fi
     save_state || { log '错误：无法保存执行状态。'; code=1; }
@@ -283,8 +322,11 @@ update_geo() (
 
   # 两个文件都通过校验后，才允许替换目标文件。
   resolve_release || return 1
-  download_and_validate geoip.dat "${release_base}/geoip.dat" "${work_dir}/geoip.dat" || return 1
-  download_and_validate geosite.dat "${release_base}/geosite.dat" "${work_dir}/geosite.dat" || return 1
+  log "正在检查上游发布：${release_base##*/}"
+  download_and_validate geoip.dat "${release_base}/geoip.dat" "${work_dir}/geoip.dat" "${geoip_path}" || return 1
+  candidate_geoip_hash=${validated_hash}
+  download_and_validate geosite.dat "${release_base}/geosite.dat" "${work_dir}/geosite.dat" "${geosite_path}" || return 1
+  candidate_geosite_hash=${validated_hash}
 
   if [[ -f ${geoip_path} ]]; then
     cp -a "${geoip_path}" "${work_dir}/geoip.previous" || return 1
@@ -374,7 +416,10 @@ update_geo() (
 )
 
 install_script_pair() (
-  local_source=$1
+  local_source=${1:-}
+  unit_source=${2:-}
+  unit_path=${UNIT_DIR}/v2bx-geo-update.service
+  unit_stage=''
   [[ ${UPDATER_PATH} != "${MANAGER_PATH}" ]] || fail '管理和更新脚本路径不能相同。'
   install -d -m 0755 "$(dirname -- "${UPDATER_PATH}")" "$(dirname -- "${MANAGER_PATH}")" || return 1
   pair_dir=$(mktemp -d /tmp/v2bx-geo-script.XXXXXX) || return 1
@@ -400,12 +445,18 @@ install_script_pair() (
       else
         rm -f "${MANAGER_PATH}" || pair_recovery_failed=1
       fi
+      if [[ -n ${unit_source} ]]; then
+        cp -p -- "${pair_dir}/service" "${unit_stage}" &&
+          mv -f "${unit_stage}" "${unit_path}" || pair_recovery_failed=1
+        systemctl daemon-reload || pair_recovery_failed=1
+      fi
       code=1
     fi
+    [[ -z ${unit_stage} ]] || rm -f "${unit_stage}"
     [[ -z ${updater_stage} ]] || rm -f "${updater_stage}"
     [[ -z ${manager_stage} ]] || rm -f "${manager_stage}"
     if [[ ${pair_recovery_failed} -eq 1 ]]; then
-      log "错误：脚本回滚失败，原版本保留在 ${pair_dir}，请手动恢复。"
+      log "错误：脚本或服务回滚失败，原版本保留在 ${pair_dir}，请手动恢复。"
     else
       rm -rf "${pair_dir}"
     fi
@@ -427,12 +478,63 @@ install_script_pair() (
   fi
   updater_stage=$(mktemp "${UPDATER_PATH}.new.XXXXXX") || return 1
   manager_stage=$(mktemp "${MANAGER_PATH}.new.XXXXXX") || return 1
-  install -m 0755 "${local_source}" "${updater_stage}" || return 1
-  install -m 0755 "${local_source}" "${manager_stage}" || return 1
+  if [[ -n ${local_source} ]]; then
+    install -m 0755 "${local_source}" "${updater_stage}" || return 1
+    install -m 0755 "${local_source}" "${manager_stage}" || return 1
+  else
+    install -m 0755 "${pair_dir}/updater" "${updater_stage}" || return 1
+    install -m 0755 "${pair_dir}/manager" "${manager_stage}" || return 1
+  fi
+  if [[ -n ${unit_source} ]]; then
+    [[ -f ${unit_path} && ! -L ${unit_path} ]] || fail '更新服务配置不是普通文件。'
+    cp -p -- "${unit_path}" "${pair_dir}/service" || return 1
+    unit_stage=$(mktemp "${unit_path}.new.XXXXXX") || return 1
+    cp -p -- "${unit_path}" "${unit_stage}" || return 1
+    cat "${unit_source}" >"${unit_stage}" || return 1
+  fi
   pair_pending=1
   mv -f "${updater_stage}" "${UPDATER_PATH}" || return 1
   mv -f "${manager_stage}" "${MANAGER_PATH}" || return 1
+  if [[ -n ${unit_source} ]]; then
+    mv -f "${unit_stage}" "${unit_path}" || return 1
+    systemctl daemon-reload || return 1
+  fi
   pair_pending=0
+)
+
+service_needs_migration() {
+  grep -Eq '^[[:space:]]*ExecStart=.*[[:space:]]--update[[:space:]]*$' \
+    "${UNIT_DIR}/v2bx-geo-update.service"
+}
+
+# 调用方持锁。只迁移已知旧参数，保留 Environment、调度、drop-in 和 timer 状态。
+upgrade_installation() (
+  local candidate=${1:-} migration_dir
+  local service_path=${UNIT_DIR}/v2bx-geo-update.service
+  [[ -f ${service_path} && ! -L ${service_path} ]] || fail '更新服务配置缺失或不是普通文件，请检查安装。'
+  if service_needs_migration; then
+    [[ $(grep -Ec '^[[:space:]]*ExecStart=' "${service_path}") -eq 1 ]] || fail '服务包含自定义多条 ExecStart，无法自动迁移。'
+    migration_dir=$(mktemp -d /tmp/v2bx-geo-migrate.XXXXXX) || return 1
+    trap 'rm -rf "${migration_dir}"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    sed -E 's/^([[:space:]]*ExecStart=.*[[:space:]])--update[[:space:]]*$/\1--scheduled-update/' \
+      "${service_path}" >"${migration_dir}/service" || return 1
+    install_script_pair "${candidate}" "${migration_dir}/service" || return 1
+    log '已迁移定时更新配置，保留原有路径、调度和 timer 启用状态。'
+  else
+    grep -Eq '^[[:space:]]*ExecStart=.*[[:space:]]--scheduled-update[[:space:]]*$' \
+      "${service_path}" || fail '无法识别更新服务启动配置，未修改脚本或服务，请手动检查。'
+    [[ -z ${candidate} ]] || install_script_pair "${candidate}" || return 1
+  fi
+)
+
+# 1.3.0 的自更新仅复制脚本：新版首次运行时补迁移，不要求重新安装。
+ensure_installation_current() (
+  service_needs_migration || return 0
+  acquire_lock || return 1
+  prepare_state || return 1
+  upgrade_installation
 )
 
 self_update() (
@@ -461,13 +563,14 @@ self_update() (
   }
   newest=$(printf '%s\n%s\n' "${VERSION}" "${new_version}" | sort -V | tail -n 1)
   if [[ ${new_version} == "${VERSION}" ]]; then
-    log "当前已是最新版本 ${VERSION}。"
+    upgrade_installation || return 1
+    log "当前已是最新版本 ${VERSION}，安装配置已检查。"
     return 0
   fi
   [[ ${newest} == "${new_version}" ]] || {
     log "远程版本 ${new_version} 低于当前版本 ${VERSION}，拒绝降级。"; return 1;
   }
-  install_script_pair "${temp_dir}/install.sh" || return 1
+  upgrade_installation "${temp_dir}/install.sh" || return 1
   log "脚本已从 ${VERSION} 更新到 ${new_version}，下次运行使用新版本。"
 )
 
@@ -490,7 +593,7 @@ show_version() {
 # 每次都由 load_state 从磁盘重新读取状态。
 # shellcheck disable=SC2031
 show_status() {
-  local last_attempt last_success last_result
+  local last_attempt last_success last_result last_release last_geoip_hash last_geosite_hash
   local timer_state='未运行'
   local timer_enabled='否'
   local v2bx_state='未运行'
@@ -540,7 +643,7 @@ show_status() {
     updated) echo '上次结果：成功，Geo 文件已更新' ;;
     unchanged) echo '上次结果：成功，文件无变化' ;;
     failed) echo '上次结果：更新失败，请查看日志' ;;
-    recovery_failed) echo '上次结果：回滚失败，需要手动恢复，请查看日志' ;;
+    recovery_failed) echo '上次结果：文件或服务恢复失败，需要手动处理，请查看日志' ;;
     running) echo '上次结果：执行中（若任务已退出，则上次执行被中断）' ;;
     *) echo '上次结果：旧版本未保存执行结果' ;;
   esac
@@ -551,6 +654,9 @@ show_status() {
     echo '下次执行：暂时无法获取'
   fi
   echo "Geo 文件目录：${V2BX_DIR}"
+  echo "最近成功验证的上游版本：${last_release:-暂无记录}"
+  echo "最近成功验证的 GeoIP SHA-256：${last_geoip_hash:-暂无记录}"
+  echo "最近成功验证的 GeoSite SHA-256：${last_geosite_hash:-暂无记录}"
 }
 
 show_log() {
@@ -734,7 +840,7 @@ After=network-online.target
 Type=oneshot
 TimeoutStartSec=2h
 Environment=TZ=CST-8
-ExecStart="$(unit_escape "${UPDATER_PATH//\$/\$\$}")" --update
+ExecStart="$(unit_escape "${UPDATER_PATH//\$/\$\$}")" --scheduled-update
 EOF
 
   # 与手动更新使用相同配置，防止自定义路径只在安装时有效。
@@ -764,11 +870,9 @@ EOF
   install -m 0644 "${timer_tmp}" "${UNIT_DIR}/v2bx-geo-update.timer"
 
   systemctl daemon-reload
-  # 首次检查先完成，再开启 Persistent timer，避免两次更新争用锁。
-  flock -u 9
-  exec 9>&-
+  # 安装全程持锁，首次检查直接复用锁；启用 timer 后退出时再释放。
   initial_ok=1
-  "${UPDATER_PATH}" --update || initial_ok=0
+  update_geo_locked || initial_ok=0
   systemctl enable --now v2bx-geo-update.timer
 
   echo
@@ -796,6 +900,11 @@ if [[ ${invoked_path} != */* ]]; then
 fi
 script_path=$(CDPATH='' cd -- "$(dirname -- "${invoked_path}")" && pwd)/$(basename -- "${invoked_path}")
 
+if [[ ${EUID} -eq 0 && ${script_path} == "${MANAGER_PATH}" && ${1:-} != uninstall &&
+      ${1:-} != install && ${1:-} != self-update && ${1:-} != help && ${1:-} != --help && ${1:-} != -h ]]; then
+  ensure_installation_current || exit 1
+fi
+
 if [[ $# -eq 0 && ${script_path} == "${MANAGER_PATH}" ]]; then
   require_root
   show_menu
@@ -805,6 +914,11 @@ fi
 action=${1:-install}
 
 case "${action}" in
+  --scheduled-update)
+    require_root
+    update_geo wait
+    exit $?
+    ;;
   --update|update)
     require_root
     update_geo
