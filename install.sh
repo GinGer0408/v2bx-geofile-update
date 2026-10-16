@@ -17,7 +17,7 @@ BACKUP_DIR=${V2BX_GEO_BACKUP_DIR:-/var/backups/V2bX-geo}
 STATE_DIR=${V2BX_GEO_STATE_DIR:-/var/lib/v2bx-geo}
 UNIT_DIR=${V2BX_GEO_UNIT_DIR:-/etc/systemd/system}
 SCRIPT_URL='https://raw.githubusercontent.com/GinGer0408/v2bx-geofile-update/main/install.sh'
-VERSION='1.4.0'
+VERSION='1.4.1'
 GEOIP_URL='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
 
 log() {
@@ -732,7 +732,7 @@ show_menu() {
     fi
 
     echo
-    echo 'V2bX Geo 文件管理脚本'
+    echo "V2bX Geo 文件管理脚本  v${VERSION}"
     echo '--- https://github.com/GinGer0408/v2bx-geofile-update ---'
     echo '--------------------------------'
     echo "V2bX 状态：${v2bx_state}"
@@ -745,11 +745,10 @@ show_menu() {
     echo '3. 重载自动更新任务'
     echo '4. 查看 Geo 文件信息'
     echo '5. 卸载自动更新任务'
-    echo '6. 查看脚本版本'
+    echo '6. 更新管理脚本版本'
     echo '7. 退出脚本'
-    echo '8. 更新管理脚本版本'
     echo '--------------------------------'
-    read -r -p '请输入选择 [0-8]：' choice || return 0
+    read -r -p '请输入选择 [0-7]：' choice || return 0
     echo
 
     case ${choice} in
@@ -782,15 +781,11 @@ show_menu() {
         echo '已取消卸载。'
         pause_menu
         ;;
-      6)
-        show_version
-        pause_menu
-        ;;
       7)
         echo '已退出脚本。'
         return 0
         ;;
-      8)
+      6)
         if self_update; then
           exec bash "${MANAGER_PATH}"
         fi
@@ -798,7 +793,7 @@ show_menu() {
         pause_menu
         ;;
       *)
-        echo '输入无效，请输入 0 到 8。'
+        echo '输入无效，请输入 0 到 7。'
         pause_menu
         ;;
     esac

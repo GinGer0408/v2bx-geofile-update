@@ -10,7 +10,7 @@
 wget -N https://raw.githubusercontent.com/GinGer0408/v2bx-geofile-update/main/install.sh && bash install.sh
 ```
 
-安装脚本需要以 `root` 身份运行。当前脚本版本为 `1.4.0`。
+安装脚本需要以 `root` 身份运行。当前脚本版本为 `1.4.1`。
 
 适用于 systemd 正在运行、服务名为 `V2bX.service` 的标准 V2bX 部署，不支持 Alpine/OpenRC。依赖 Bash、curl、coreutils（含 sha256sum）、util-linux（含 flock）和 tzdata。安装脚本可自动安装 curl；缺少其他工具时会提示并退出。
 
@@ -35,15 +35,16 @@ wget -N https://raw.githubusercontent.com/GinGer0408/v2bx-geofile-update/main/in
 安装完成后，直接运行 `v2bx-geo` 即可打开中文管理菜单：
 
 ```text
+V2bX Geo 文件管理脚本  v1.4.1
+
 0. 立即更新 Geo 文件
 1. 查看自动更新状态
 2. 查看更新日志
 3. 重载自动更新任务
 4. 查看 Geo 文件信息
 5. 卸载自动更新任务
-6. 查看脚本版本
+6. 更新管理脚本版本
 7. 退出脚本
-8. 更新管理脚本版本
 ```
 
 也可以直接使用命令：

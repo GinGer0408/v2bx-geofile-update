@@ -111,8 +111,8 @@ fi
     def state(self):
         return dict(line.split('\t', 1) for line in (self.root / 'state' / 'status').read_text().splitlines())
 
-    def installed_pair(self, version='1.4.0'):
-        old = SOURCE.read_text().replace("VERSION='1.4.0'", f"VERSION='{version}'")
+    def installed_pair(self, version='1.4.1'):
+        old = SOURCE.read_text().replace("VERSION='1.4.1'", f"VERSION='{version}'")
         for key in ('V2BX_GEO_UPDATER', 'V2BX_GEO_MANAGER'):
             path = Path(self.env[key])
             path.parent.mkdir(exist_ok=True)
@@ -124,7 +124,7 @@ fi
         return old
 
     def remote_version(self, version):
-        (self.root / 'remote.sh').write_text(SOURCE.read_text().replace("VERSION='1.4.0'", f"VERSION='{version}'"))
+        (self.root / 'remote.sh').write_text(SOURCE.read_text().replace("VERSION='1.4.1'", f"VERSION='{version}'"))
 
     def test_status_converts_utc_to_beijing_in_any_timezone(self):
         for zone in ('UTC', 'America/Los_Angeles', 'Asia/Tokyo'):
@@ -220,7 +220,7 @@ fi
 
     def test_self_update_same_version_no_change(self):
         old = self.installed_pair()
-        self.remote_version('1.4.0')
+        self.remote_version('1.4.1')
         result = self.run_function('self_update')
         self.assertEqual(result.returncode, 0)
         self.assertIn('当前已是最新版本', result.stdout)
@@ -280,7 +280,7 @@ exec /usr/bin/mv "$@"
     def test_same_version_repairs_pending_migration(self):
         old = self.installed_pair()
         service = self.legacy_service()
-        self.remote_version('1.4.0')
+        self.remote_version('1.4.1')
         result = self.run_function('self_update')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('--scheduled-update', service.read_text())
@@ -343,14 +343,14 @@ fi
         self.installed_pair('1.3.0')
         service = self.legacy_service()
         fixture = SOURCE.parent / 'tests' / 'fixtures' / 'self_update_1_3.sh'
-        self.remote_version('1.4.0')
+        self.remote_version('1.4.1')
         result = self.run_function('source "' + str(fixture) + '"; self_update')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('--update', service.read_text())
         result = subprocess.run(['bash', self.env['V2BX_GEO_MANAGER'], 'version'],
                                 env=self.env, capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('1.4.0', result.stdout)
+        self.assertIn('1.4.1', result.stdout)
         self.assertIn('--scheduled-update', service.read_text())
         self.assertEqual(self.calls.read_text(), 'daemon-reload\n')
         self.assertEqual((self.root / 'downloads').read_text().splitlines(), [
