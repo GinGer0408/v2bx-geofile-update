@@ -23,7 +23,11 @@ jobs:
       - uses: actions/checkout@v6
       - name: Check updater syntax without installing services
         run: bash -n install.sh
+      - name: Check shell diagnostics
+        run: shellcheck -x -P SCRIPTDIR install.sh tests/smoke_upstream.sh
       - name: Check help and version commands
         run: |
           bash install.sh --help
           bash install.sh version
+      - name: Test update transactions and recovery
+        run: sudo python3 -m unittest discover -s tests -v
